@@ -19,6 +19,20 @@ class TextPreprocessUseCase(TextPreprocessInPort):
         self.text_preprocessor = text_preprocessor
         self.out_port = out_port
 
+    def clean_comment(self, raw_comment: str) -> str:
+        return self.text_preprocessor.preprocess(raw_comment)
+
+    def clean_description(self, raw_desc: str) -> str:
+        return self.text_preprocessor.preprocess(raw_desc)
+
+    def clean_generic(self, text: str) -> str:
+        """
+        특별한 구분 없이 일반 텍스트 정제.
+        """
+        return self.text_preprocessor.preprocess(text)
+    
+
+
     def preprocess_comment(self, raw_comment: str) -> str:
         cleaned = self.text_preprocessor.preprocess(raw_comment)
 
