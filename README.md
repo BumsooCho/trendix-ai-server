@@ -13,3 +13,4 @@ SQL_PASSWORD={pw}
 SQL_HOST={host}
 SQL_PORT=6543
 SQL_DATABASE=postgres
+
