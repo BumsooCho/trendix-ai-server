@@ -10,3 +10,4 @@ pydantic
 redis
 requests
 boto3
+python-multipart
