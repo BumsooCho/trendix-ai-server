@@ -7,6 +7,7 @@ from config.settings import OpenAISettings
 
 MODEL_NAME = "gpt-4o"
 
+
 class ChatMessage(BaseModel):
     role: str = Field(pattern="^(user|assistant|system)$")
     content: str = Field(min_length=1)
@@ -17,32 +18,7 @@ class ChatRequest(BaseModel):
     model: str | None = None
 
 
-class ChatResponse(BaseModel):
-    reply: str
-
-
 chat_router = APIRouter(tags=["chat"])
-
-
-@chat_router.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse:
-    settings = OpenAISettings()
-    if not settings.api_key:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
-
-    client = OpenAI(api_key=settings.api_key)
-    model = MODEL_NAME
-
-    try:
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[{"role": m.role, "content": m.content} for m in request.messages],
-        )
-    except Exception as exc:  # OpenAI 예외 일괄 처리
-        raise HTTPException(status_code=500, detail=f"OpenAI chat request failed: {exc}")
-
-    reply = completion.choices[0].message.content if completion.choices else ""
-    return ChatResponse(reply=reply or "")
 
 
 @chat_router.post("/chat/stream")
