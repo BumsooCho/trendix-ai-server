@@ -53,3 +53,29 @@ async def list_categories(limit: int = Query(default=100, ge=1, le=500)):
     if not categories:
         raise HTTPException(status_code=404, detail="등록된 카테고리가 없습니다.")
     return JSONResponse(jsonable_encoder({"categories": categories}))
+
+
+@trend_router.get("/videos/surge")
+async def get_surge_videos(
+    limit: int = Query(default=30, ge=1, le=100),
+    days: int = Query(default=3, ge=1, le=30, description="최근 N일 내 업로드/수집된 영상만 대상"),
+    velocity_days: int = Query(
+        default=1,
+        ge=1,
+        le=7,
+        description="단기 증가량/증가율 비교 기준 일수 (예: 1일 전과 비교)",
+    ),
+    platform: str | None = Query(default=None, description="플랫폼 필터 (예: youtube)"),
+):
+    """
+    급등(스파이크) 영상 랭킹 리스트를 조회한다.
+
+    - delta_views_window / growth_rate_window: 최근 velocity_days일 기준 단기 증가량/증가율
+    - surge_score: 간단한 급등 점수(현재는 growth_rate 기반, 추후 조합식으로 확장 가능)
+    """
+    items = usecase.get_surge_videos(
+        platform=platform, limit=limit, days=days, velocity_days=velocity_days
+    )
+    if not items:
+        raise HTTPException(status_code=404, detail="급등 영상이 없습니다.")
+    return JSONResponse(jsonable_encoder({"items": items}))

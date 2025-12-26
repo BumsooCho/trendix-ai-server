@@ -572,3 +572,111 @@ class ContentRepositoryImpl(ContentRepositoryPort):
             {"limit": limit},
         ).scalars()
         return list(rows)
+
+    def fetch_surge_videos(
+        self,
+        platform: str | None = None,
+        limit: int = 30,
+        days: int = 3,
+        velocity_days: int = 1,
+    ) -> list[dict]:
+        """
+        단기 조회수 증가량/증가율(일 단위 스냅샷 기반)을 활용해 급등 영상 랭킹을 계산한다.
+
+        - days: 최근 N일 내 업로드/수집된 영상만 대상
+        - velocity_days: 이전 스냅샷 기준 일수 (예: 1일 전과 비교)
+        """
+        to_date = datetime.utcnow().date()
+        from_date = to_date - timedelta(days=days - 1)
+        prev_anchor = to_date - timedelta(days=velocity_days)
+
+        rows = self.db.execute(
+            text(
+                """
+                SELECT
+                    v.video_id,
+                    v.title,
+                    v.channel_id,
+                    v.platform,
+                    vs.category,
+                    COALESCE(curr.view_count, v.view_count, 0) AS view_count,
+                    COALESCE(prev.view_count, 0) AS view_count_prev,
+                    COALESCE(curr.like_count, v.like_count, 0) AS like_count,
+                    COALESCE(prev.like_count, 0) AS like_count_prev,
+                    COALESCE(curr.comment_count, v.comment_count, 0) AS comment_count,
+                    COALESCE(prev.comment_count, 0) AS comment_count_prev,
+                    (COALESCE(curr.view_count, v.view_count, 0) - COALESCE(prev.view_count, 0)) / :velocity_days AS view_velocity,
+                    (COALESCE(curr.like_count, v.like_count, 0) - COALESCE(prev.like_count, 0)) / :velocity_days AS like_velocity,
+                    (COALESCE(curr.comment_count, v.comment_count, 0) - COALESCE(prev.comment_count, 0)) / :velocity_days AS comment_velocity,
+                    COALESCE(sc.total_score, sc.sentiment_score, sc.trend_score, 0) AS total_score,
+                    v.published_at,
+                    v.thumbnail_url,
+                    v.crawled_at
+                FROM video v
+                LEFT JOIN video_sentiment vs ON vs.video_id = v.video_id
+                LEFT JOIN video_score sc ON sc.video_id = v.video_id
+                LEFT JOIN LATERAL (
+                    SELECT s.view_count, s.like_count, s.comment_count
+                    FROM video_metrics_snapshot s
+                    WHERE s.video_id = v.video_id
+                      AND s.platform = v.platform
+                      AND s.snapshot_date <= :to_date
+                    ORDER BY s.snapshot_date DESC
+                    LIMIT 1
+                ) curr ON true
+                LEFT JOIN LATERAL (
+                    SELECT s.view_count, s.like_count, s.comment_count
+                    FROM video_metrics_snapshot s
+                    WHERE s.video_id = v.video_id
+                      AND s.platform = v.platform
+                      AND s.snapshot_date <= :prev_anchor
+                    ORDER BY s.snapshot_date DESC
+                    LIMIT 1
+                ) prev ON true
+                WHERE COALESCE(v.published_at::date, v.crawled_at::date) BETWEEN :from_date AND :to_date
+                  AND (:platform IS NULL OR v.platform = :platform)
+                ORDER BY view_velocity DESC NULLS LAST,
+                         comment_velocity DESC NULLS LAST,
+                         like_velocity DESC NULLS LAST,
+                         total_score DESC NULLS LAST,
+                         v.crawled_at DESC NULLS LAST
+                LIMIT :limit
+                """
+            ),
+            {
+                "from_date": from_date,
+                "to_date": to_date,
+                "prev_anchor": prev_anchor,
+                "platform": platform,
+                "velocity_days": velocity_days,
+                "limit": limit,
+            },
+        ).mappings()
+
+        now = datetime.utcnow()
+        result: list[dict] = []
+        for r in rows:
+            view_now = int(r["view_count"] or 0)
+            view_prev = int(r["view_count_prev"] or 0)
+            delta_views = view_now - view_prev
+            base_views = view_prev if view_prev > 0 else 1
+            growth_rate = delta_views / base_views if (view_now or view_prev) else 0.0
+
+            published_at = r.get("published_at")
+            if published_at is not None:
+                age_minutes = max((now - published_at).total_seconds() / 60.0, 0.0)
+                age_hours = age_minutes / 60.0
+            else:
+                age_minutes = None
+                age_hours = None
+
+            item = dict(r)
+            item["delta_views_window"] = float(delta_views)
+            item["growth_rate_window"] = float(growth_rate)
+            item["age_minutes"] = age_minutes
+            item["age_hours"] = age_hours
+            # 간단한 급등 점수: 단기 증가율 * log(현재 조회수 + 10) 형태 등으로 확장 가능
+            item["surge_score"] = growth_rate
+            result.append(item)
+
+        return result
