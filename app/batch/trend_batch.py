@@ -3,6 +3,7 @@ import os
 from datetime import date
 
 from sqlalchemy import text
+from datetime import date
 
 from content.application.usecase.trend_aggregation_usecase import TrendAggregationUseCase
 from content.infrastructure.repository.content_repository_impl import ContentRepositoryImpl

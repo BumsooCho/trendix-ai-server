@@ -1,4 +1,4 @@
-# apple-mango-ai-server!
+# apple-mango-ai-server
 apple mango ai server
 
 ## (25.12.08 - 1) pip install 라이브러리 모음 (구동 시 설치 필요)
@@ -13,4 +13,3 @@ SQL_PASSWORD={pw}
 SQL_HOST={host}
 SQL_PORT=6543
 SQL_DATABASE=postgres
-
