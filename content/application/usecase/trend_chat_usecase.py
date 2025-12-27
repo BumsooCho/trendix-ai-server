@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-from openai import OpenAI
+from fastapi.encoders import jsonable_encoder
+from openai import OpenAI, Stream
+from openai.types.chat import ChatCompletionChunk
 
 from config.settings import OpenAISettings
 from content.application.usecase.trend_featured_usecase import TrendFeaturedUseCase
@@ -35,7 +37,7 @@ class TrendChatUseCase:
         rising_limit: int = 5,
         velocity_days: int = 1,
         platform: str | None = None,
-    ) -> tuple[str, list[dict]]:
+    ) -> Tuple[Stream[ChatCompletionChunk], Tuple[str, list[dict]]]:
         # 유저 질문 추출 (마지막 user 메시지)
         query = ""
         for msg in reversed(user_messages):
@@ -56,6 +58,7 @@ class TrendChatUseCase:
 
         context_text = self._build_context(trends)
         relevant = self._retrieve_relevant_items(query, trends, top_k=6)
+        print(relevant)
 
         messages = [
             {
@@ -75,12 +78,14 @@ class TrendChatUseCase:
             },
         ] + user_messages
 
-        completion = self.client.chat.completions.create(
+        stream = self.client.chat.completions.create(
             model=self.settings.model or "gpt-4o",
             messages=messages,
+            stream=True
         )
-        reply = completion.choices[0].message.content or ""
-        return reply, self._serialize_relevant(relevant)
+
+        # reply = completion.choices[0].message.content or ""
+        return stream, self._serialize_relevant(relevant)
 
     def _retrieve_relevant_items(self, query: str, trends: dict, top_k: int = 5) -> List[Tuple[float, dict]]:
         """
@@ -125,18 +130,32 @@ class TrendChatUseCase:
         """
         payload: list[dict] = []
         for sim, item in scored_items:
+            raw_data = {
+                "source": item.get("source"),
+                "video_id": item.get("video_id"),
+                "title": item.get("title"),
+                "channel_id": item.get("channel_id"),
+                "platform": item.get("platform"),
+                "view_count": item.get("view_count"),
+                "like_count": item.get("like_count"),
+                "comment_count": item.get("comment_count"),
+                "published_at": item.get("published_at"),  # str() 안 해도 됨
+                "thumbnail_url": item.get("thumbnail_url"),
+                "category": item.get("category"),
+                "sentiment_label": item.get("sentiment_label"),
+                "sentiment_score": item.get("sentiment_score"),
+                "trend_score": item.get("trend_score"),
+                "engagement_score": item.get("engagement_score"),
+                "score_sentiment": item.get("score_sentiment"),
+                "score_trend": item.get("score_trend"),
+                "total_score": item.get("total_score"),
+                "crawled_at": item.get("crawled_at"),
+                "channel_username": item.get("channel_username"),
+                "similarity": round(sim, 3),
+            }
+            clean_data = jsonable_encoder(raw_data)
             payload.append(
-                {
-                    "source": item.get("source"),
-                    "video_id": item.get("video_id"),
-                    "title": item.get("title"),
-                    "category": item.get("category"),
-                    "channel_id": item.get("channel_id"),
-                    "view_count": item.get("view_count"),
-                    "total_score": item.get("total_score"),
-                    "thumbnail_url": item.get("thumbnail_url"),
-                    "similarity": round(sim, 3),
-                }
+                clean_data
             )
         return payload
 

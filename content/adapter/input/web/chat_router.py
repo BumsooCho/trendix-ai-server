@@ -134,26 +134,29 @@ async def chat_stream(request_body: ChatRequest, request: Request):
             if request_body.conversationId:
                 yield f"data: {json.dumps({'conversationId': request_body.conversationId})}\n\n"
 
+            stream = None
+
             if intent == "trend":
                 usecase = _get_trend_chat_usecase(settings)
-                reply, relevant = usecase.answer_with_trends(
+                stream, relevant = usecase.answer_with_trends(
                     user_messages=user_messages,
                     popular_limit=request_body.popular_limit,
                     rising_limit=request_body.rising_limit,
                     velocity_days=request_body.velocity_days,
                     platform=request_body.platform,
                 )
-                data = f"data: {json.dumps({'content': reply, 'relevant': relevant}, ensure_ascii=False)}\n\n"
-                yield data
-                yield "data: [DONE]\n\n"
-                return
-
-            client = OpenAI(api_key=settings.api_key)
-            stream = client.chat.completions.create(
-                model=model,
-                messages=user_messages,
-                stream=True,
-            )
+                yield f"data: {json.dumps({"videos" : relevant}, ensure_ascii=False)}\n\n"
+                # data = f"data: {json.dumps({'content': reply, 'relevant': relevant}, ensure_ascii=False)}\n\n"
+                # yield data
+                # yield "data: [DONE]\n\n"
+                # return
+            else:
+                client = OpenAI(api_key=settings.api_key)
+                stream = client.chat.completions.create(
+                    model=model,
+                    messages=user_messages,
+                    stream=True,
+                )
 
             for chunk in stream:
                 if await request.is_disconnected():
