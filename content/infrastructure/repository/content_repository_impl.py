@@ -1,4 +1,4 @@
-from typing import Iterable
+from typing import Any, Iterable
 from datetime import datetime, timedelta
 
 from sqlalchemy import text
@@ -303,6 +303,7 @@ class ContentRepositoryImpl(ContentRepositoryPort):
                     v.comment_count,
                     v.published_at,
                     v.thumbnail_url,
+                    v.category_id,
                     vs.category,
                     vs.sentiment_label,
                     vs.sentiment_score,
@@ -325,18 +326,29 @@ class ContentRepositoryImpl(ContentRepositoryPort):
         return [dict(row) for row in rows]
 
     def fetch_videos_by_category_id(
-        self, category_id: int, limit: int = 10, platform: str | None = None
+        self, category_id: int, limit: int = 10, platform: str | None = None, days: int | None = None
     ) -> list[dict]:
         """
         YouTube category_id 기준 상위 콘텐츠를 조회한다.
         - category_id: YouTube Data API의 숫자 categoryId (예: 10=Music, 20=Gaming)
+        - days: 최근 N일 내 게시된 영상만 대상 (None이면 전체)
         """
+        since_date = None
+        until_date = None
+        if days is not None:
+            since_date = (datetime.utcnow() - timedelta(days=days)).date()
+            until_date = datetime.utcnow().date()
+        
         rows = self.db.execute(
             text(
                 """
                 SELECT
                     v.video_id,
                     v.title,
+                    v.description,
+                    v.tags,
+                    v.category_id,
+                    v.duration,
                     v.channel_id,
                     v.platform,
                     v.view_count,
@@ -344,7 +356,8 @@ class ContentRepositoryImpl(ContentRepositoryPort):
                     v.comment_count,
                     v.published_at,
                     v.thumbnail_url,
-                    v.category_id,
+                    v.crawled_at,
+                    v.is_shorts,
                     vs.category,
                     vs.sentiment_label,
                     vs.sentiment_score,
@@ -358,12 +371,20 @@ class ContentRepositoryImpl(ContentRepositoryPort):
                 LEFT JOIN video_score sc ON sc.video_id = v.video_id
                 WHERE v.category_id = :category_id
                   AND (:platform IS NULL OR v.platform = :platform)
+                  AND (:since_date IS NULL OR v.published_at::date >= :since_date)
+                  AND (:until_date IS NULL OR v.published_at::date <= :until_date)
                 ORDER BY COALESCE(sc.total_score, sc.sentiment_score, sc.trend_score, v.view_count) DESC NULLS LAST,
                          v.crawled_at DESC
                 LIMIT :limit
                 """
             ),
-            {"category_id": category_id, "platform": platform, "limit": limit},
+            {
+                "category_id": category_id,
+                "platform": platform,
+                "limit": limit,
+                "since_date": since_date,
+                "until_date": until_date,
+            },
         ).mappings()
         return [dict(row) for row in rows]
 
@@ -672,10 +693,10 @@ class ContentRepositoryImpl(ContentRepositoryPort):
         return [dict(r) for r in rows]
 
     def fetch_recommended_videos_by_category(
-        self, category_id: int, limit: int = 20, days: int = 14, platform: str | None = None
+        self, category: str, limit: int = 20, days: int = 14, platform: str | None = None
     ) -> list[dict]:
         """
-        카테고리 내 최근 수집 콘텐츠를 점수 기반으로 추천한다.
+        카테고리 문자열(category) 기준으로 최근 수집 콘텐츠를 점수 기반으로 추천한다.
         """
         # 이전 예외로 인한 pending rollback 상태 방지
         try:
@@ -723,7 +744,7 @@ class ContentRepositoryImpl(ContentRepositoryPort):
                 LEFT JOIN video_score sc ON sc.video_id = v.video_id
                 LEFT JOIN creator_account ca ON ca.account_id = v.channel_id AND ca.platform = v.platform
                 LEFT JOIN channel ch ON ch.channel_id = v.channel_id
-                WHERE v.category_id = :category_id
+                WHERE vs.category = :category
                   AND v.published_at::date BETWEEN :since_date AND :until_date
                   AND (:platform IS NULL OR v.platform = :platform)
                 ORDER BY COALESCE(sc.total_score, sc.sentiment_score, sc.trend_score, v.view_count) DESC NULLS LAST,
@@ -732,7 +753,7 @@ class ContentRepositoryImpl(ContentRepositoryPort):
                 """
             ),
             {
-                "category_id": category_id,
+                "category": category,
                 "since_date": since_date,
                 "until_date": until_date,
                 "platform": platform,
