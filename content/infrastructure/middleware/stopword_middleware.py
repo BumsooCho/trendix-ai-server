@@ -28,9 +28,8 @@ class StopwordMiddleware(BaseHTTPMiddleware):
                         # Request를 새로 만들어 body 수정
                         body = body_bytes.decode("utf-8")
                         json_body = json.loads(body)
-                        cleaned_body = usecase.remove_stopwords_iterative(json_body)
+                        cleaned_body = self._usecase.remove_stopwords_iterative(json_body)
                         request.state.cleaned_body = cleaned_body
-                        print(f"Middleware cleaned: {cleaned_body}") 
 
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
                         print(f"JSON/UTF-8 decode error: {e}")

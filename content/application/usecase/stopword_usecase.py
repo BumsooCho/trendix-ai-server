@@ -84,7 +84,7 @@ class StopwordUseCase:
 
         # 불용어를 빈 문자열로 치환
         result = re.sub(pattern, '', text)
-        #print(f"texts={text}, result={result}")
+        print(f"texts={text}, result={result}")
         return result
     
     def filter_stopwords(self, text: str) -> str:
