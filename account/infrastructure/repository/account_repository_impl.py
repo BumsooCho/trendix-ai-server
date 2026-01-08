@@ -21,8 +21,14 @@ class AccountRepositoryImpl(AccountRepositoryPort):
             # 세션 상태 확인을 위해 간단한 쿼리 시도
             self.db.execute(text("SELECT 1"))
         except (InvalidRequestError, PendingRollbackError, OperationalError):
+            # 기존 세션을 명시적으로 닫아서 Connection Pool에 즉시 반환
+            # (GC에 의존하면 연결 반환이 지연되어 Connection Pool 고갈 가능)
+            try:
+                self.db.close()
+            except Exception:
+                pass  # 이미 닫힌 경우 무시
+
             # 세션이 invalid 상태거나 연결이 끊어진 경우, 새 세션 생성
-            # (기존 세션 정리는 GC가 처리)
             self.db = get_db_session()
 
     def save(self, account: Account) -> Account:
