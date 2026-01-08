@@ -20,6 +20,7 @@ engine = create_engine(
     DATABASE_URL,
     echo=os.getenv("SQL_ECHO", "false").lower() == "true",
     pool_pre_ping=True,
+    pool_recycle= 300,  # 5분마다 재사용
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
