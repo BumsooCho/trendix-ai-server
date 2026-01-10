@@ -1041,7 +1041,14 @@ class ContentRepositoryImpl(ContentRepositoryPort):
     ) -> list[dict]:
         """
         단기 조회수 증가량/증가율(일 단위 스냅샷 기반)을 활용해 급등 영상 랭킹을 계산한다.
-
+        
+        최적화 내용:
+        1. LATERAL JOIN → CTE로 변경: 각 비디오마다 서브쿼리를 실행하지 않고 한번에 처리
+        2. DISTINCT ON 활용: 최신/이전 스냅샷을 효율적으로 가져오기
+        3. Python loop 내 추가 쿼리 제거: alt_snapshot 조회 로직 제거
+        4. SQL에서 surge_score 계산: Python 연산 최소화
+        5. 배치 upsert: video_score 업데이트를 루프에서 한 번에 처리
+        
         - days: 최근 N일 내 업로드/수집된 영상만 대상
         - velocity_days: 이전 스냅샷 기준 일수 (예: 1일 전과 비교)
         """
@@ -1049,255 +1056,250 @@ class ContentRepositoryImpl(ContentRepositoryPort):
             self.db.rollback()
         except Exception:
             pass
+        
         to_date = datetime.utcnow().date()
         from_date = to_date - timedelta(days=days - 1)
-        prev_anchor = to_date - timedelta(days=velocity_days)
+        now = datetime.utcnow()
 
+        # 최적화된 SQL: CTE를 사용해 스냅샷 조회를 한 번에 처리
         rows = self.db.execute(
             text(
                 """
+                WITH 
+                -- 1단계: 대상 비디오 필터링 (최근 N일)
+                target_videos AS (
+                    SELECT video_id, platform
+                    FROM video v
+                    WHERE COALESCE(v.published_at::date, v.crawled_at::date) BETWEEN :from_date AND :to_date
+                      AND (:platform IS NULL OR v.platform = :platform)
+                ),
+                -- 2단계: 최신 스냅샷 (DISTINCT ON으로 최적화)
+                latest_snapshot AS (
+                    SELECT DISTINCT ON (vms.video_id, vms.platform)
+                        vms.video_id,
+                        vms.platform,
+                        vms.view_count AS curr_view,
+                        vms.like_count AS curr_like,
+                        vms.comment_count AS curr_comment,
+                        vms.snapshot_date AS curr_date
+                    FROM video_metrics_snapshot vms
+                    INNER JOIN target_videos tv ON vms.video_id = tv.video_id AND vms.platform = tv.platform
+                    WHERE vms.snapshot_date <= :to_date
+                    ORDER BY vms.video_id, vms.platform, vms.snapshot_date DESC
+                ),
+                -- 3단계: 이전 스냅샷 (최신보다 이전 것 중 가장 최근 것)
+                prev_snapshot AS (
+                    SELECT DISTINCT ON (vms.video_id, vms.platform)
+                        vms.video_id,
+                        vms.platform,
+                        vms.view_count AS prev_view,
+                        vms.like_count AS prev_like,
+                        vms.comment_count AS prev_comment
+                    FROM video_metrics_snapshot vms
+                    INNER JOIN latest_snapshot ls 
+                        ON vms.video_id = ls.video_id 
+                        AND vms.platform = ls.platform
+                    WHERE vms.snapshot_date < ls.curr_date
+                      AND vms.snapshot_date >= :to_date - INTERVAL '30 days'
+                    ORDER BY vms.video_id, vms.platform, vms.snapshot_date DESC
+                ),
+                -- 4단계: 메인 데이터 조합 및 surge 지표 계산
+                surge_calc AS (
+                    SELECT
+                        v.video_id,
+                        v.title,
+                        v.description,
+                        v.tags,
+                        v.category_id,
+                        v.duration,
+                        v.channel_id,
+                        v.platform,
+                        v.published_at,
+                        v.thumbnail_url,
+                        v.crawled_at,
+                        v.is_shorts,
+                        vs.category,
+                        COALESCE(ch.title, v.channel_id) AS channel_username,
+                        
+                        -- 현재 및 이전 지표
+                        COALESCE(ls.curr_view, v.view_count, 0)::BIGINT AS view_count,
+                        COALESCE(ps.prev_view, 0)::BIGINT AS view_count_prev,
+                        COALESCE(ls.curr_like, v.like_count, 0)::BIGINT AS like_count,
+                        COALESCE(ps.prev_like, 0)::BIGINT AS like_count_prev,
+                        COALESCE(ls.curr_comment, v.comment_count, 0)::BIGINT AS comment_count,
+                        COALESCE(ps.prev_comment, 0)::BIGINT AS comment_count_prev,
+                        
+                        -- 증가량
+                        (COALESCE(ls.curr_view, v.view_count, 0) - COALESCE(ps.prev_view, 0))::BIGINT AS delta_views,
+                        (COALESCE(ls.curr_like, v.like_count, 0) - COALESCE(ps.prev_like, 0))::BIGINT AS delta_likes,
+                        (COALESCE(ls.curr_comment, v.comment_count, 0) - COALESCE(ps.prev_comment, 0))::BIGINT AS delta_comments,
+                        
+                        -- Velocity (일 단위 증가량)
+                        (COALESCE(ls.curr_view, v.view_count, 0) - COALESCE(ps.prev_view, 0))::FLOAT / NULLIF(:velocity_days, 0) AS view_velocity,
+                        (COALESCE(ls.curr_like, v.like_count, 0) - COALESCE(ps.prev_like, 0))::FLOAT / NULLIF(:velocity_days, 0) AS like_velocity,
+                        (COALESCE(ls.curr_comment, v.comment_count, 0) - COALESCE(ps.prev_comment, 0))::FLOAT / NULLIF(:velocity_days, 0) AS comment_velocity,
+                        
+                        -- 증가율
+                        CASE 
+                            WHEN COALESCE(ps.prev_view, 0) > 0 THEN 
+                                (COALESCE(ls.curr_view, v.view_count, 0) - COALESCE(ps.prev_view, 0))::FLOAT / ps.prev_view
+                            ELSE 0.0
+                        END AS growth_rate,
+                        
+                        -- 경과 시간 계산 (시간 단위)
+                        EXTRACT(EPOCH FROM (:now - v.published_at)) / 3600.0 AS age_hours,
+                        
+                        -- Freshness score (지수 감쇠 + 보너스)
+                        CASE 
+                            WHEN v.published_at IS NOT NULL THEN
+                                EXP(-0.05 * (EXTRACT(EPOCH FROM (:now - v.published_at)) / 3600.0)) *
+                                CASE 
+                                    WHEN EXTRACT(EPOCH FROM (:now - v.published_at)) / 3600.0 <= 24 THEN 1.5
+                                    WHEN EXTRACT(EPOCH FROM (:now - v.published_at)) / 3600.0 <= 48 THEN 1.2
+                                    WHEN EXTRACT(EPOCH FROM (:now - v.published_at)) / 3600.0 <= 72 THEN 1.1
+                                    ELSE 1.0
+                                END
+                            ELSE 0.5
+                        END AS freshness_score_with_bonus,
+                        
+                        COALESCE(sc.total_score, sc.sentiment_score, sc.trend_score, 0) AS total_score
+                        
+                    FROM video v
+                    INNER JOIN target_videos tv ON v.video_id = tv.video_id AND v.platform = tv.platform
+                    LEFT JOIN latest_snapshot ls ON ls.video_id = v.video_id AND ls.platform = v.platform
+                    LEFT JOIN prev_snapshot ps ON ps.video_id = v.video_id AND ps.platform = v.platform
+                    LEFT JOIN video_sentiment vs ON vs.video_id = v.video_id
+                    LEFT JOIN video_score sc ON sc.video_id = v.video_id
+                    LEFT JOIN channel ch ON ch.channel_id = v.channel_id
+                )
+                -- 5단계: Surge Score 계산 및 정렬
                 SELECT
-                    v.video_id,
-                    v.title,
-                    v.description,
-                    v.tags,
-                    v.category_id,
-                    v.duration,
-                    v.channel_id,
-                    v.platform,
-                    vs.category,
-                    COALESCE(curr.view_count, v.view_count, 0) AS view_count,
-                    COALESCE(prev.view_count, 0) AS view_count_prev,
-                    COALESCE(curr.like_count, v.like_count, 0) AS like_count,
-                    COALESCE(prev.like_count, 0) AS like_count_prev,
-                    COALESCE(curr.comment_count, v.comment_count, 0) AS comment_count,
-                    COALESCE(prev.comment_count, 0) AS comment_count_prev,
-                    (COALESCE(curr.view_count, v.view_count, 0) - COALESCE(prev.view_count, 0)) / :velocity_days AS view_velocity,
-                    (COALESCE(curr.like_count, v.like_count, 0) - COALESCE(prev.like_count, 0)) / :velocity_days AS like_velocity,
-                    (COALESCE(curr.comment_count, v.comment_count, 0) - COALESCE(prev.comment_count, 0)) / :velocity_days AS comment_velocity,
-                    COALESCE(sc.total_score, sc.sentiment_score, sc.trend_score, 0) AS total_score,
-                    v.published_at,
-                    v.thumbnail_url,
-                    v.crawled_at,
-                    v.is_shorts,
-                    -- 채널명: channel.title 우선 사용
-                    COALESCE(ch.title, ca.username, ca.display_name, v.channel_id) AS channel_username
-                FROM video v
-                LEFT JOIN video_sentiment vs ON vs.video_id = v.video_id
-                LEFT JOIN video_score sc ON sc.video_id = v.video_id
-                LEFT JOIN creator_account ca ON ca.account_id = v.channel_id AND ca.platform = v.platform
-                LEFT JOIN channel ch ON ch.channel_id = v.channel_id
-                LEFT JOIN LATERAL (
-                    SELECT s.view_count, s.like_count, s.comment_count
-                    FROM video_metrics_snapshot s
-                    WHERE s.video_id = v.video_id
-                      AND s.platform = v.platform
-                      AND s.snapshot_date <= :to_date
-                    ORDER BY s.snapshot_date DESC
-                    LIMIT 1
-                ) curr ON true
-                LEFT JOIN LATERAL (
-                    SELECT s.view_count, s.like_count, s.comment_count
-                    FROM video_metrics_snapshot s
-                    WHERE s.video_id = v.video_id
-                      AND s.platform = v.platform
-                      AND s.snapshot_date < (
-                          SELECT MAX(s2.snapshot_date)
-                          FROM video_metrics_snapshot s2
-                          WHERE s2.video_id = v.video_id
-                            AND s2.platform = v.platform
-                      )
-                    ORDER BY s.snapshot_date DESC
-                    LIMIT 1
-                ) prev ON true
-                WHERE COALESCE(v.published_at::date, v.crawled_at::date) BETWEEN :from_date AND :to_date
-                  AND (:platform IS NULL OR v.platform = :platform)
+                    *,
+                    -- Surge Score 계산 (SQL에서 직접 수행)
+                    (
+                        (growth_rate * 100) +                                    -- growth_factor
+                        (view_velocity / 1000.0) +                               -- velocity_factor
+                        (LN(GREATEST(view_count, 1) + 10) * 0.1) +              -- popularity_factor
+                        (freshness_score_with_bonus * 50)                       -- freshness_factor
+                    ) AS surge_score,
+                    
+                    -- 증가율 퍼센트
+                    ROUND((growth_rate * 100)::NUMERIC, 1) AS growth_rate_percentage
+                    
+                FROM surge_calc
+                WHERE view_count > 0  -- 조회수가 0인 영상 제외
                 ORDER BY 
-                    -- 최우선: velocity가 있는 영상들을 상위에 배치
-                    CASE WHEN COALESCE(curr.view_count, v.view_count, 0) - COALESCE(prev.view_count, 0) > 0 THEN 1 ELSE 0 END DESC,
-                    -- velocity 기반 정렬
+                    -- velocity가 있는 영상 우선
+                    CASE WHEN delta_views > 0 THEN 1 ELSE 0 END DESC,
+                    -- Surge Score 기준 정렬
+                    surge_score DESC NULLS LAST,
                     view_velocity DESC NULLS LAST,
-                    comment_velocity DESC NULLS LAST, 
-                    like_velocity DESC NULLS LAST,
-                    -- fallback: velocity 데이터가 없는 경우 절대값 기준
-                    COALESCE(curr.view_count, v.view_count, 0) DESC,
-                    total_score DESC NULLS LAST,
-                    v.published_at DESC NULLS LAST
-                LIMIT :limit
+                    view_count DESC
+                LIMIT :limit_fetch
                 """
             ),
             {
                 "from_date": from_date,
                 "to_date": to_date,
-                "prev_anchor": prev_anchor,
                 "platform": platform,
                 "velocity_days": velocity_days,
-                "limit": limit,
+                "limit_fetch": limit * 2,  # 여유있게 가져온 후 재정렬
+                "now": now,
             },
         ).mappings()
 
         import math
 
-        now = datetime.utcnow()
         result: list[dict] = []
+        video_scores_to_upsert = []
 
-
-        # 1차로 SQL 정렬 기준에 따라 surge_score를 계산해 result 리스트를 만든다.
-        for rank, r in enumerate(rows, 1):
-            view_now = int(r["view_count"] or 0)
-            view_prev = int(r["view_count_prev"] or 0)
-            video_id = r["video_id"]
-
-            # 현재와 이전 값이 같은 경우 더 이전 스냅샷에서 다른 값 찾기
-            if view_prev == view_now and view_prev > 0:
-                try:
-                    alt_snapshot = self.db.execute(
-                        text('''
-                            SELECT view_count
-                            FROM video_metrics_snapshot s
-                            WHERE s.video_id = :video_id
-                              AND s.platform = 'youtube'
-                              AND s.snapshot_date <= CURRENT_DATE - INTERVAL '1 day'
-                              AND s.view_count <> :current_view
-                            ORDER BY s.snapshot_date DESC
-                            LIMIT 1
-                        '''),
-                        {'video_id': video_id, 'current_view': view_now}
-                    ).fetchone()
-
-                    if alt_snapshot:
-                        view_prev = int(alt_snapshot[0])
-                except Exception:
-                    pass
-
-            # 증가량 계산: 스냅샷이 없으면 현재 값 전체가 증가량
-            delta_views = view_now - view_prev
-            base_views = view_prev if view_prev > 0 else 1
-            growth_rate = delta_views / base_views if view_prev > 0 else 0.0
-
-            published_at = r.get("published_at")
-
-            # === 업로드 경과 시간(Freshness) 계산 ===
-            if published_at is not None:
-                # 현재 시각 - 업로드 시각 = 경과 시간
-                time_elapsed = now - published_at
-                age_seconds = max(time_elapsed.total_seconds(), 0.0)
-                age_minutes = age_seconds / 60.0
-                age_hours = age_minutes / 60.0
-                age_days = age_hours / 24.0
-
-                # Freshness Score: 최신 콘텐츠일수록 높은 점수
-                # 지수 감쇠 함수 사용: freshness = exp(-λ * age_hours)
-                # λ = 0.05 → 24시간 후 약 0.30, 48시간 후 약 0.09
-                freshness_decay_rate = 0.05
-                freshness_score = math.exp(-freshness_decay_rate * age_hours)
-
-                # 추가 보너스: 24시간 이내 업로드는 추가 가중치
-                if age_hours <= 24:
-                    freshness_bonus = 1.5
-                elif age_hours <= 48:
-                    freshness_bonus = 1.2
-                elif age_hours <= 72:
-                    freshness_bonus = 1.1
-                else:
-                    freshness_bonus = 1.0
-
-                freshness_score_with_bonus = freshness_score * freshness_bonus
-            else:
-                # 업로드 시각이 없는 경우 기본값
-                age_seconds = None
-                age_minutes = None
-                age_hours = None
-                age_days = None
-                freshness_score = 0.5  # 중간 값
-                freshness_bonus = 1.0
-                freshness_score_with_bonus = 0.5
-
-            # 좋아요 및 댓글 증가량 계산
-            like_now = int(r["like_count"] or 0)
-            like_prev = int(r["like_count_prev"] or 0)
-            comment_now = int(r["comment_count"] or 0)
-            comment_prev = int(r["comment_count_prev"] or 0)
-
-            delta_likes = like_now - like_prev
-            delta_comments = comment_now - comment_prev
-
+        # SQL 결과를 Python에서 추가 가공 (최소화)
+        for r in rows:
             item = dict(r)
-
-            # 경과 시간 정보
-            item["age_seconds"] = age_seconds
-            item["age_minutes"] = age_minutes
-            item["age_hours"] = age_hours
-            item["age_days"] = age_days
-
-            # Freshness 점수
-            item["freshness_score"] = round(freshness_score, 4)
-            item["freshness_bonus"] = freshness_bonus
-            item["freshness_score_with_bonus"] = round(freshness_score_with_bonus, 4)
-
-            # 증가 지표
+            
+            view_now = int(item["view_count"] or 0)
+            delta_views = int(item["delta_views"] or 0)
+            
+            # age 관련 필드 계산
+            if item.get("age_hours") is not None:
+                age_hours = float(item["age_hours"])
+                item["age_seconds"] = age_hours * 3600
+                item["age_minutes"] = age_hours * 60
+                item["age_days"] = age_hours / 24
+            else:
+                item["age_seconds"] = None
+                item["age_minutes"] = None
+                item["age_days"] = None
+            
+            # 프론트엔드용 필드 매핑
+            item["view_count_change"] = int(item["delta_views"] or 0)
+            item["like_count_change"] = int(item["delta_likes"] or 0)
+            item["comment_count_change"] = int(item["delta_comments"] or 0)
             item["delta_views_window"] = float(delta_views)
-            item["growth_rate_window"] = float(growth_rate)
-
-            # 프론트엔드용 성장 지표 필드 추가
-            item["view_count_change"] = int(delta_views)
-            item["like_count_change"] = int(delta_likes)
-            item["comment_count_change"] = int(delta_comments)
-            item["growth_rate_percentage"] = round(growth_rate * 100, 1) if growth_rate != 0 else 0.0
-
-            item["age_minutes"] = age_minutes
-            item["age_hours"] = age_hours
-            # === 개선된 급등 점수(Surge Score) 계산 ===
-            # 요소 1: 현재 인기도 (로그 스케일)
-            base_popularity = math.log(max(view_now, 1) + 10)
-
-            # 요소 2: 시간당 증가량 (velocity) 정규화
-            velocity_factor = float(r["view_velocity"] or 0) / 1000.0
-
-            # 요소 3: 성장률 (growth_rate) - 백분율로 변환
-            growth_factor = growth_rate * 100
-
-            # 요소 4: Freshness - 최신 콘텐츠에 가중치
-            freshness_factor = freshness_score_with_bonus * 50  # 0~75 범위로 스케일링
-
-            # 최종 Surge Score = 성장률 + velocity + 인기도 + Freshness
-            surge_score = (
-                growth_factor +           # 성장률 기여도
-                velocity_factor +         # 절대 증가량 기여도
-                (base_popularity * 0.1) + # 현재 인기도 기여도
-                freshness_factor          # 신선도 기여도
-            )
-
+            item["growth_rate_window"] = float(item["growth_rate"] or 0.0)
+            
+            # Freshness 점수 분해
+            freshness_with_bonus = float(item["freshness_score_with_bonus"] or 0.5)
+            if (item.get("age_hours") or 999) <= 24:
+                item["freshness_score"] = round(freshness_with_bonus / 1.5, 4)
+                item["freshness_bonus"] = 1.5
+            elif (item.get("age_hours") or 999) <= 48:
+                item["freshness_score"] = round(freshness_with_bonus / 1.2, 4)
+                item["freshness_bonus"] = 1.2
+            elif (item.get("age_hours") or 999) <= 72:
+                item["freshness_score"] = round(freshness_with_bonus / 1.1, 4)
+                item["freshness_bonus"] = 1.1
+            else:
+                item["freshness_score"] = round(freshness_with_bonus, 4)
+                item["freshness_bonus"] = 1.0
+            
+            # Surge score 반올림
+            surge_score = float(item.get("surge_score") or 0.0)
             item["surge_score"] = round(surge_score, 2)
-            item["trending_rank"] = rank  # 백엔드에서 정렬된 순위
-
-            # 디버깅/분석용 세부 점수
+            
+            # 디버깅용 세부 점수
+            growth_factor = (item["growth_rate"] or 0.0) * 100
+            velocity_factor = (item["view_velocity"] or 0.0) / 1000.0
+            popularity_factor = math.log(max(view_now, 1) + 10) * 0.1
+            freshness_factor = freshness_with_bonus * 50
+            
             item["surge_components"] = {
                 "growth_factor": round(growth_factor, 2),
                 "velocity_factor": round(velocity_factor, 2),
-                "popularity_factor": round(base_popularity * 0.1, 2),
+                "popularity_factor": round(popularity_factor, 2),
                 "freshness_factor": round(freshness_factor, 2),
             }
-
-            # 이전 스냅샷 데이터는 프론트에서 불필요하므로 제거
+            
+            # 이전 스냅샷 데이터 제거
             item.pop("view_count_prev", None)
             item.pop("like_count_prev", None)
             item.pop("comment_count_prev", None)
-
+            
             result.append(item)
-
-        # surge_score 기준으로 전체 내림차순 정렬 후 rank를 부여한다.
+            
+            # 배치 upsert를 위한 데이터 수집
+            video_scores_to_upsert.append({
+                "video_id": item["video_id"],
+                "platform": item.get("platform") or "youtube",
+                "trend_score": item["surge_score"],
+                "updated_at": now,
+            })
+        
+        # Surge score 기준으로 최종 정렬 및 limit 적용
         result_sorted = sorted(
             result,
             key=lambda x: x.get("surge_score") or 0.0,
             reverse=True,
-        )
-
+        )[:limit]
+        
+        # Ranking 부여
         for idx, item in enumerate(result_sorted, 1):
             item["trending_rank"] = idx
-
-            # video_score.trend_score에 surge_score를 upsert 한다.
+        
+        # 배치 upsert: 한 번의 트랜잭션으로 모든 video_score 업데이트
+        if video_scores_to_upsert:
             try:
+                # limit만큼만 upsert
                 self.db.execute(
                     text(
                         """
@@ -1308,22 +1310,12 @@ class ContentRepositoryImpl(ContentRepositoryPort):
                             updated_at = EXCLUDED.updated_at
                         """
                     ),
-                    {
-                        "video_id": item["video_id"],
-                        "platform": item.get("platform") or "youtube",
-                        "trend_score": item["surge_score"],
-                        "updated_at": now,
-                    },
+                    video_scores_to_upsert[:limit],
                 )
-            except Exception:
-                # 점수 저장 실패는 조회 자체를 막지 않기 위해 무시한다.
-                pass
-
-        try:
-            self.db.commit()
-        except Exception:
-            # commit 에러도 조회 응답은 유지하되, 추후 로그/모니터링으로 대응
-            self.db.rollback()
+                self.db.commit()
+            except Exception as e:
+                self.db.rollback()
+                print(f"Error batch upserting trend_scores: {e}")
 
         return result_sorted
 
